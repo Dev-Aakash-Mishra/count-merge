@@ -1,0 +1,40 @@
+name: Parallel PPMI Merge
+
+on:
+  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+
+jobs:
+  merge:
+    name: Build, Download & Merge PPMI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Removed Free Disk Space step because the runner already has 89 GB of free space,
+      # which is more than enough for the 24.5 GB download, and avoids the time-consuming rm -rf step.
+
+      - name: Install C++ Compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential g++
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Run Pipeline (Download & Merge)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          uv run merge.py
+
+      - name: Upload Final PPMI Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final_ppmi_scores
+          path: final_ppmi_scores.csv
+          if-no-files-found: error
+          retention-days: 7
