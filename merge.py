@@ -167,6 +167,9 @@ def main() -> None:
             output_path
         ])
         proc.wait()
+        if proc.returncode != 0:
+            print(f"ERROR: C++ merger process exited with code {proc.returncode}.", file=sys.stderr, flush=True)
+            sys.exit(proc.returncode)
 
         # 5. Cleanup
         if os.path.exists(files_list_path):
