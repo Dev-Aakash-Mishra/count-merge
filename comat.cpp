@@ -30,8 +30,9 @@ struct StreamState {
     int tail;
     bool eof;
     FILE* f;
+    string file_path;
 
-    StreamState(int idx, const string& path) : stream_idx(idx), head(0), tail(0), eof(false), f(nullptr) {
+    StreamState(int idx, const string& path) : stream_idx(idx), head(0), tail(0), eof(false), f(nullptr), file_path(path) {
         // Caching 2M records = 16 MB buffer per stream to leverage large RAM on GitHub runner.
         // For 88 streams, this will consume ~1.4 GB RAM, which is extremely safe on a 16 GB machine.
         buffer.resize(2097152); 
@@ -48,6 +49,15 @@ struct StreamState {
     ~StreamState() {
         if (f) {
             fclose(f);
+        }
+    }
+
+    void rewind() {
+        if (f) {
+            fseek(f, 0, SEEK_SET);
+            head = 0;
+            tail = 0;
+            eof = false;
         }
     }
 
@@ -88,9 +98,6 @@ struct HeapItem {
         return value > other.value;
     }
 };
-
-// Global states in RAM (pre-allocated)
-vector<Record> global_records;
 
 int main(int argc, char* argv[]) {
     if (argc < 5) {
@@ -202,17 +209,17 @@ int main(int argc, char* argv[]) {
     }
 
     // ────────────────────────────────────────────────────────
-    // PPMI & STATS CALCULATION MODE
+    // PPMI & STATS CALCULATION MODE (3-Pass Streaming Merger)
     // ────────────────────────────────────────────────────────
-    // Reserve memory up-front (200 million records = 1.6 GB RAM) to eliminate reallocation / resize overhead
-    global_records.reserve(200000000);
+    
+    // ── PASS 1: Merge streams to build count histogram and find max token ID ──
+    vector<uint64_t> global_histogram(1000000, 0);
+    unordered_map<uint32_t, uint64_t> large_counts_map;
 
     uint32_t current_key = 0xFFFFFFFF;
     uint64_t current_count = 0;
-
-    // Histogram arrays for O(1) memory statistics calculation
-    vector<uint64_t> global_histogram(1000000, 0);
-    unordered_map<uint32_t, uint64_t> large_counts_map;
+    uint64_t total_pairs = 0;
+    uint32_t max_token_id = 0;
 
     while (!pq.empty()) {
         MergeItem top = pq.top();
@@ -223,8 +230,13 @@ int main(int argc, char* argv[]) {
         } else {
             if (current_key != 0xFFFFFFFF) {
                 uint32_t final_c = (current_count > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)current_count;
-                global_records.push_back({(uint16_t)(current_key >> 16), (uint16_t)(current_key & 0xFFFF), final_c});
+                total_pairs++;
                 
+                uint16_t u = (uint16_t)(current_key >> 16);
+                uint16_t v = (uint16_t)(current_key & 0xFFFF);
+                if (u > max_token_id) max_token_id = u;
+                if (v > max_token_id) max_token_id = v;
+
                 if (final_c < 1000000) {
                     global_histogram[final_c]++;
                 } else {
@@ -244,8 +256,13 @@ int main(int argc, char* argv[]) {
 
     if (current_key != 0xFFFFFFFF) {
         uint32_t final_c = (current_count > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)current_count;
-        global_records.push_back({(uint16_t)(current_key >> 16), (uint16_t)(current_key & 0xFFFF), final_c});
+        total_pairs++;
         
+        uint16_t u = (uint16_t)(current_key >> 16);
+        uint16_t v = (uint16_t)(current_key & 0xFFFF);
+        if (u > max_token_id) max_token_id = u;
+        if (v > max_token_id) max_token_id = v;
+
         if (final_c < 1000000) {
             global_histogram[final_c]++;
         } else {
@@ -253,64 +270,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Clean up streams
-    for (auto s : streams) {
-        delete s;
-    }
-
-    uint64_t total_pairs = global_records.size();
-    uint64_t sum_counts = 0;
-
-    for (uint32_t c = 1; c < 1000000; ++c) {
-        sum_counts += global_histogram[c] * c;
-    }
-    for (const auto& p : large_counts_map) {
-        sum_counts += p.second * p.first;
-    }
-
-    double mean_val = total_pairs > 0 ? (double)sum_counts / total_pairs : 0.0;
-    
-    // Mode
-    uint64_t max_freq = 0;
-    int mode_val = 0;
-    for (uint32_t c = 1; c < 1000000; ++c) {
-        if (global_histogram[c] > max_freq) {
-            max_freq = global_histogram[c];
-            mode_val = c;
-        }
-    }
-    for (const auto& p : large_counts_map) {
-        if (p.second > max_freq) {
-            max_freq = p.second;
-            mode_val = p.first;
-        }
-    }
-
-    // Median
-    uint64_t target = total_pairs / 2;
-    uint64_t cumulative = 0;
-    int median_val = 0;
-
-    for (uint32_t c = 1; c < 1000000; ++c) {
-        cumulative += global_histogram[c];
-        if (cumulative >= target) {
-            median_val = c;
-            break;
-        }
-    }
-    if (median_val == 0) {
-        vector<pair<uint32_t, uint64_t>> large_pairs(large_counts_map.begin(), large_counts_map.end());
-        sort(large_pairs.begin(), large_pairs.end());
-        for (const auto& p : large_pairs) {
-            cumulative += p.second;
-            if (cumulative >= target) {
-                median_val = p.first;
-                break;
-            }
-        }
-    }
-
-    cerr << "STATS:MEAN=" << mean_val << ";MEDIAN=" << median_val << ";MODE=" << mode_val << endl;
+    uint32_t vocab_size = max_token_id + 1;
+    cerr << "STATS:TOTAL_PAIRS=" << total_pairs << ";DYNAMIC_VOCAB_SIZE=" << vocab_size << endl;
 
     // Apply percentile thresholding
     uint64_t target_thresh = (uint64_t)(total_pairs * percentile);
@@ -338,75 +299,170 @@ int main(int argc, char* argv[]) {
 
     cerr << "STATS:THRESHOLD=" << threshold << endl;
 
-    // Filter in-place
-    auto it = remove_if(global_records.begin(), global_records.end(), [threshold](const Record& r) {
-        return r.count < threshold;
-    });
-    global_records.erase(it, global_records.end());
-    global_records.shrink_to_fit();
+    // Free histogram memory
+    global_histogram.clear();
+    global_histogram.shrink_to_fit();
+    large_counts_map.clear();
 
-    cerr << "STATS:REMAINING_PAIRS=" << global_records.size() << endl;
-
-    // Calculate marginals
-    vector<uint64_t> marginal_counts(52022, 0);
-    uint64_t ppmi_total_sum = 0;
-
-    for (const auto& r : global_records) {
-        marginal_counts[r.i] += r.count;
-        marginal_counts[r.j] += r.count;
-        ppmi_total_sum += 2 * r.count;
+    // ── PASS 2: Rewind streams, merge again, filter, calculate marginals, and buffer to temp disk ──
+    for (auto s : streams) {
+        s->rewind();
+    }
+    pq = priority_queue<MergeItem, vector<MergeItem>, greater<MergeItem>>();
+    for (int s = 0; s < num_streams; ++s) {
+        Record r;
+        if (streams[s]->next(r)) {
+            pq.push({r.key(), r.count, s});
+        }
     }
 
-    // Build flat cache-friendly representation for PPMI heaps (52022 tokens, max 60 neighbors each)
-    // Allocates ~25 MB as a single block in RAM, avoiding 52,022 separate mallocs.
-    vector<HeapItem> flat_heaps(52022 * 60);
-    vector<int> heap_sizes(52022, 0);
+    // Open temporary file for storing filtered records
+    string temp_file_path = string(output_path) + ".tmp";
+    FILE* f_temp = fopen(temp_file_path.c_str(), "wb");
+    if (!f_temp) {
+        cerr << "ERROR: cannot open temporary storage " << temp_file_path << endl;
+        return 1;
+    }
+    setvbuf(f_temp, NULL, _IOFBF, 16 * 1024 * 1024);
+
+    vector<Record> write_buf;
+    write_buf.reserve(65536);
+
+    vector<uint64_t> marginal_counts(vocab_size, 0);
+    uint64_t ppmi_total_sum = 0;
+    uint64_t remaining_pairs = 0;
+
+    current_key = 0xFFFFFFFF;
+    current_count = 0;
+
+    while (!pq.empty()) {
+        MergeItem top = pq.top();
+        pq.pop();
+
+        if (top.key == current_key) {
+            current_count += top.count;
+        } else {
+            if (current_key != 0xFFFFFFFF) {
+                uint32_t final_c = (current_count > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)current_count;
+                if (final_c >= threshold) {
+                    uint16_t u = (uint16_t)(current_key >> 16);
+                    uint16_t v = (uint16_t)(current_key & 0xFFFF);
+                    
+                    marginal_counts[u] += final_c;
+                    marginal_counts[v] += final_c;
+                    ppmi_total_sum += 2 * final_c;
+                    remaining_pairs++;
+
+                    write_buf.push_back({u, v, final_c});
+                    if (write_buf.size() >= 65536) {
+                        fwrite(write_buf.data(), sizeof(Record), write_buf.size(), f_temp);
+                        write_buf.clear();
+                    }
+                }
+            }
+            current_key = top.key;
+            current_count = top.count;
+        }
+
+        int s = top.stream_idx;
+        Record r;
+        if (streams[s]->next(r)) {
+            pq.push({r.key(), r.count, s});
+        }
+    }
+
+    if (current_key != 0xFFFFFFFF) {
+        uint32_t final_c = (current_count > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)current_count;
+        if (final_c >= threshold) {
+            uint16_t u = (uint16_t)(current_key >> 16);
+            uint16_t v = (uint16_t)(current_key & 0xFFFF);
+            
+            marginal_counts[u] += final_c;
+            marginal_counts[v] += final_c;
+            ppmi_total_sum += 2 * final_c;
+            remaining_pairs++;
+
+            write_buf.push_back({u, v, final_c});
+        }
+    }
+    if (!write_buf.empty()) {
+        fwrite(write_buf.data(), sizeof(Record), write_buf.size(), f_temp);
+    }
+    fclose(f_temp);
+
+    // Clean up readers
+    for (auto s : streams) {
+        delete s;
+    }
+    streams.clear();
+
+    cerr << "STATS:REMAINING_PAIRS=" << remaining_pairs << endl;
+
+    // ── PASS 3: Read filtered binary records sequentially from temp disk and build heaps ──
+    vector<HeapItem> flat_heaps(vocab_size * 60);
+    vector<int> heap_sizes(vocab_size, 0);
 
     double log_total_sum = log((double)ppmi_total_sum);
 
-    for (const auto& r : global_records) {
-        uint16_t u = r.i;
-        uint16_t v = r.j;
-        uint32_t count = r.count;
+    FILE* f_temp_in = fopen(temp_file_path.c_str(), "rb");
+    if (!f_temp_in) {
+        cerr << "ERROR: cannot open temporary storage for reading " << temp_file_path << endl;
+        return 1;
+    }
+    setvbuf(f_temp_in, NULL, _IOFBF, 16 * 1024 * 1024);
 
-        uint64_t mu = marginal_counts[u];
-        uint64_t mv = marginal_counts[v];
+    vector<Record> read_buf(65536);
+    while (true) {
+        size_t n = fread(read_buf.data(), sizeof(Record), read_buf.size(), f_temp_in);
+        if (n <= 0) break;
 
-        if (mu == 0 || mv == 0 || ppmi_total_sum == 0) continue;
+        for (size_t k = 0; k < n; ++k) {
+            const auto& r = read_buf[k];
+            uint16_t u = r.i;
+            uint16_t v = r.j;
+            uint32_t count = r.count;
 
-        double ppmi_val = log((double)count) + log_total_sum - log((double)mu) - log((double)mv);
-        if (ppmi_val <= 0.0) continue;
+            uint64_t mu = marginal_counts[u];
+            uint64_t mv = marginal_counts[v];
 
-        float f_ppmi = (float)ppmi_val;
+            if (mu == 0 || mv == 0 || ppmi_total_sum == 0) continue;
 
-        // Heap operations on flat_heaps for u
-        int& su = heap_sizes[u];
-        HeapItem* hu = &flat_heaps[u * 60];
-        if (su < 60) {
-            hu[su] = {f_ppmi, v};
-            su++;
-            push_heap(hu, hu + su, greater<HeapItem>());
-        } else if (f_ppmi > hu[0].value) {
-            pop_heap(hu, hu + su, greater<HeapItem>());
-            hu[59] = {f_ppmi, v};
-            push_heap(hu, hu + su, greater<HeapItem>());
-        }
+            double ppmi_val = log((double)count) + log_total_sum - log((double)mu) - log((double)mv);
+            if (ppmi_val <= 0.0) continue;
 
-        // Heap operations on flat_heaps for v
-        int& sv = heap_sizes[v];
-        HeapItem* hv = &flat_heaps[v * 60];
-        if (sv < 60) {
-            hv[sv] = {f_ppmi, u};
-            sv++;
-            push_heap(hv, hv + sv, greater<HeapItem>());
-        } else if (f_ppmi > hv[0].value) {
-            pop_heap(hv, hv + sv, greater<HeapItem>());
-            hv[59] = {f_ppmi, u};
-            push_heap(hv, hv + sv, greater<HeapItem>());
+            float f_ppmi = (float)ppmi_val;
+
+            // Heap operations on flat_heaps for u
+            int& su = heap_sizes[u];
+            HeapItem* hu = &flat_heaps[u * 60];
+            if (su < 60) {
+                hu[su] = {f_ppmi, v};
+                su++;
+                push_heap(hu, hu + su, greater<HeapItem>());
+            } else if (f_ppmi > hu[0].value) {
+                pop_heap(hu, hu + su, greater<HeapItem>());
+                hu[59] = {f_ppmi, v};
+                push_heap(hu, hu + su, greater<HeapItem>());
+            }
+
+            // Heap operations on flat_heaps for v
+            int& sv = heap_sizes[v];
+            HeapItem* hv = &flat_heaps[v * 60];
+            if (sv < 60) {
+                hv[sv] = {f_ppmi, u};
+                sv++;
+                push_heap(hv, hv + sv, greater<HeapItem>());
+            } else if (f_ppmi > hv[0].value) {
+                pop_heap(hv, hv + sv, greater<HeapItem>());
+                hv[59] = {f_ppmi, u};
+                push_heap(hv, hv + sv, greater<HeapItem>());
+            }
         }
     }
+    fclose(f_temp_in);
+    remove(temp_file_path.c_str()); // Clean up temp file from disk
 
-    // Write final PPMI CSV file
+    // ── Write final PPMI CSV file ──
     FILE* f_out = fopen(output_path, "w");
     if (!f_out) {
         cerr << "ERROR: cannot open output file " << output_path << endl;
@@ -418,7 +474,7 @@ int main(int argc, char* argv[]) {
 
     fprintf(f_out, "i,j,ppmi\n");
 
-    for (uint16_t i = 0; i < 52022; ++i) {
+    for (uint32_t i = 0; i < vocab_size; ++i) {
         int su = heap_sizes[i];
         if (su == 0) continue;
 
