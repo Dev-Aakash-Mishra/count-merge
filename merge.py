@@ -30,8 +30,15 @@ PERCENTILE: float = 0.50  # Cutoff percentile: drops bottom 50% of counts (media
 MAX_DOWNLOAD_WORKERS: int = 4  # Concurrency for batch download (4 workers to avoid API rate limits)
 BATCH_SIZE: int = 8  # Number of files to process per batch (keeps disk usage under 25 GB)
 
-# Load environment variables
+# Load environment variables (checking CWD, script directory, and parent directories to find .env)
 load_dotenv()
+if not os.getenv("HF_TOKEN"):
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+if not os.getenv("HF_TOKEN"):
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+if not os.getenv("HF_TOKEN"):
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"))
+
 HF_TOKEN: str = os.getenv("HF_TOKEN", "")
 
 def compile_executable() -> str:
