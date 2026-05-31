@@ -12,9 +12,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Removed Free Disk Space step because the runner already has 89 GB of free space,
-      # which is more than enough for the 24.5 GB download, and avoids the time-consuming rm -rf step.
-
       - name: Install C++ Compiler
         run: |
           sudo apt-get update
@@ -27,6 +24,7 @@ jobs:
 
       - name: Run Pipeline (Download & Merge)
         env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_ENABLE_HF_TRANSFER: "1"
           HF_XET_HIGH_PERFORMANCE: "1"
           HF_HUB_DOWNLOAD_TIMEOUT: "300"
