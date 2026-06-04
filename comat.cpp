@@ -88,14 +88,16 @@ struct MergeItem {
 };
 
 struct HeapItem {
-    float value; // PPMI value
+    float score; // PPMI^2 * PNPMI
     uint16_t neighbor;
+    float ppmi;
+    float pnpmi;
 
     bool operator>(const HeapItem& other) const {
-        if (value == other.value) {
+        if (score == other.score) {
             return neighbor > other.neighbor;
         }
-        return value > other.value;
+        return score > other.score;
     }
 };
 
@@ -398,7 +400,7 @@ int main(int argc, char* argv[]) {
 
     cerr << "STATS:REMAINING_PAIRS=" << remaining_pairs << endl;
 
-    // ── PASS 3: Read filtered binary records sequentially from temp disk and build heaps ──
+    // ── PASS 3: Read filtered binary records sequentially from temp disk and build heaps sorted by SCORE ──
     vector<HeapItem> flat_heaps(vocab_size * 60);
     vector<int> heap_sizes(vocab_size, 0);
 
@@ -427,34 +429,43 @@ int main(int argc, char* argv[]) {
 
             if (mu == 0 || mv == 0 || ppmi_total_sum == 0) continue;
 
-            double ppmi_val = log((double)count) + log_total_sum - log((double)mu) - log((double)mv);
-            if (ppmi_val <= 0.0) continue;
+            double pmi_val = log((double)count) + log_total_sum - log((double)mu) - log((double)mv);
+            float ppmi = (pmi_val > 0.0) ? (float)pmi_val : 0.0f;
+            if (ppmi <= 0.0f) continue;
 
-            float f_ppmi = (float)ppmi_val;
+            // Calculate PNPMI and score
+            double denom = log_total_sum - log((double)count);
+            float pnpmi = 0.0f;
+            if (denom > 0.0) {
+                double npmi = (double)ppmi / denom;
+                pnpmi = (npmi > 0.0) ? (float)npmi : 0.0f;
+            }
 
-            // Heap operations on flat_heaps for u
+            float score = ppmi * ppmi * pnpmi;
+
+            // Heap operations on flat_heaps for u (ordered by SCORE)
             int& su = heap_sizes[u];
             HeapItem* hu = &flat_heaps[u * 60];
             if (su < 60) {
-                hu[su] = {f_ppmi, v};
+                hu[su] = {score, v, ppmi, pnpmi};
                 su++;
                 push_heap(hu, hu + su, greater<HeapItem>());
-            } else if (f_ppmi > hu[0].value) {
+            } else if (score > hu[0].score) {
                 pop_heap(hu, hu + su, greater<HeapItem>());
-                hu[59] = {f_ppmi, v};
+                hu[59] = {score, v, ppmi, pnpmi};
                 push_heap(hu, hu + su, greater<HeapItem>());
             }
 
-            // Heap operations on flat_heaps for v
+            // Heap operations on flat_heaps for v (ordered by SCORE)
             int& sv = heap_sizes[v];
             HeapItem* hv = &flat_heaps[v * 60];
             if (sv < 60) {
-                hv[sv] = {f_ppmi, u};
+                hv[sv] = {score, u, ppmi, pnpmi};
                 sv++;
                 push_heap(hv, hv + sv, greater<HeapItem>());
-            } else if (f_ppmi > hv[0].value) {
+            } else if (score > hv[0].score) {
                 pop_heap(hv, hv + sv, greater<HeapItem>());
-                hv[59] = {f_ppmi, u};
+                hv[59] = {score, u, ppmi, pnpmi};
                 push_heap(hv, hv + sv, greater<HeapItem>());
             }
         }
@@ -462,7 +473,7 @@ int main(int argc, char* argv[]) {
     fclose(f_temp_in);
     remove(temp_file_path.c_str()); // Clean up temp file from disk
 
-    // ── Write final PPMI CSV file ──
+    // ── Write final PPMI / PNPMI / Score CSV file ──
     FILE* f_out = fopen(output_path, "w");
     if (!f_out) {
         cerr << "ERROR: cannot open output file " << output_path << endl;
@@ -472,7 +483,7 @@ int main(int argc, char* argv[]) {
     // Set 16 MB sequential buffer for fast text output
     setvbuf(f_out, NULL, _IOFBF, 16 * 1024 * 1024);
 
-    fprintf(f_out, "i,j,ppmi\n");
+    fprintf(f_out, "i,j,ppmi,pnpmi,score\n");
 
     for (uint32_t i = 0; i < vocab_size; ++i) {
         int su = heap_sizes[i];
@@ -480,14 +491,14 @@ int main(int argc, char* argv[]) {
 
         HeapItem* hu = &flat_heaps[i * 60];
         sort(hu, hu + su, [](const HeapItem& a, const HeapItem& b) {
-            if (a.value == b.value) {
+            if (a.score == b.score) {
                 return a.neighbor < b.neighbor;
             }
-            return a.value > b.value;
+            return a.score > b.score;
         });
 
         for (int k = 0; k < su; ++k) {
-            fprintf(f_out, "%d,%d,%f\n", i, hu[k].neighbor, hu[k].value);
+            fprintf(f_out, "%d,%d,%f,%f,%f\n", i, hu[k].neighbor, hu[k].ppmi, hu[k].pnpmi, hu[k].score);
         }
     }
 
