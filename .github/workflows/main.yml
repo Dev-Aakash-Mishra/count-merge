@@ -12,6 +12,9 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # Removed Free Disk Space step because the runner already has 89 GB of free space,
+      # which is more than enough for the 24.5 GB download, and avoids the time-consuming rm -rf step.
+
       - name: Install C++ Compiler
         run: |
           sudo apt-get update
@@ -30,6 +33,14 @@ jobs:
           HF_HUB_DOWNLOAD_TIMEOUT: "300"
         run: |
           uv run merge.py
+
+      - name: Upload Aggregated Counts Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: aggregated_counts
+          path: aggregated_counts.bin
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload Final PPMI Artifact
         uses: actions/upload-artifact@v4
