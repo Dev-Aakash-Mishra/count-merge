@@ -26,8 +26,8 @@ from tqdm import tqdm
 # CONFIGURATION
 # ============================================================
 HF_OUTPUT_REPO: str = "anisoleai/embeddings"
-PERCENTILE: float = 0.50  # Cutoff percentile: drops bottom 50% of counts (median threshold)
-MAX_DOWNLOAD_WORKERS: int = 4  # Concurrency for batch download (4 workers to avoid API rate limits)
+PERCENTILE: float = 0.90  # Cutoff percentile: drops bottom 90% of counts as requested by the user
+MAX_DOWNLOAD_WORKERS: int = 4  # Concurrency for batch download
 BATCH_SIZE: int = 8  # Number of files to process per batch (keeps disk usage under 25 GB)
 
 # Load environment variables (checking CWD, script directory, and parent directories to find .env)
@@ -152,8 +152,8 @@ def main() -> None:
 
         # Define outputs and run mode
         if is_last:
-            mode: str = "ppmi"
-            output_path: str = os.path.join(dir_path, "final_ppmi_scores.csv")
+            mode: str = "intermediate"
+            output_path: str = os.path.join(dir_path, "aggregated_counts.bin")
         else:
             mode: str = "intermediate"
             output_path: str = os.path.join(dir_path, f"temp_merged_{b_idx}.bin")
@@ -189,11 +189,37 @@ def main() -> None:
             temp_merged_path = output_path
             print(f"Batch {b_idx + 1} complete. Intermediate file: {temp_merged_path} ({os.path.getsize(temp_merged_path)/1024/1024:.2f} MB)", flush=True)
 
-    # 6. Final verification details
-    final_output: str = os.path.join(dir_path, "final_ppmi_scores.csv")
-    if os.path.exists(final_output):
-        size_mb: float = os.path.getsize(final_output) / 1024 / 1024
-        print(f"\n[Success] Final PPMI CSV saved to {final_output} ({size_mb:.2f} MB)", flush=True)
+    # 6. Final aggregated_counts.bin is now ready. Now run PPMI pass on it.
+    final_bin_path: str = os.path.join(dir_path, "aggregated_counts.bin")
+    if not os.path.exists(final_bin_path):
+        print("ERROR: aggregated_counts.bin was not found.", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    final_files_list_path: str = os.path.join(dir_path, "final_ppmi_list.txt")
+    with open(final_files_list_path, "w", encoding="utf-8") as f_list:
+        f_list.write(final_bin_path.replace("\\", "/") + "\n")
+
+    csv_output_path: str = os.path.join(dir_path, "final_ppmi_scores.csv")
+    print(f"\nLaunching C++ PPMI calculation (Percentile: {PERCENTILE*100:.0f}%)...", flush=True)
+    proc = subprocess.Popen([
+        exe_path,
+        final_files_list_path,
+        "ppmi",
+        str(PERCENTILE),
+        csv_output_path
+    ])
+    proc.wait()
+    if proc.returncode != 0:
+        print(f"ERROR: C++ PPMI process exited with code {proc.returncode}.", file=sys.stderr, flush=True)
+        sys.exit(proc.returncode)
+
+    if os.path.exists(final_files_list_path):
+        os.remove(final_files_list_path)
+
+    # 7. Final verification details
+    if os.path.exists(csv_output_path):
+        size_mb: float = os.path.getsize(csv_output_path) / 1024 / 1024
+        print(f"\n[Success] Final PPMI CSV saved to {csv_output_path} ({size_mb:.2f} MB)", flush=True)
     else:
         print("ERROR: Failed to save final CSV file.", file=sys.stderr, flush=True)
 
